@@ -2,6 +2,7 @@ local nio = require("nio")
 local lib = require("neotest.lib")
 local pytest = require("neotest-python.pytest")
 local base = require("neotest-python.base")
+local parse_results = require("neotest-python.results")
 
 ---@class neotest-python._AdapterConfig
 ---@field dap_args? table
@@ -60,12 +61,12 @@ return function(config)
     end,
     is_test_file = config.is_test_file,
     discover_positions = function(path)
-      local root = base.get_root(path) or vim.loop.cwd() or ""
+      local root = base.get_project_root(path)
 
       local python_command = config.get_python_command(root)
       local runner = config.get_runner(python_command)
 
-      local positions = lib.treesitter.parse_positions(path, base.treesitter_queries(runner, config, python_command), {
+      local positions = lib.treesitter.parse_positions(path, base.treesitter_queries(runner, config, python_command, root), {
         require_namespaces = runner == "unittest",
       })
 
@@ -80,7 +81,7 @@ return function(config)
     build_spec = function(args)
       local position = args.tree:data()
 
-      local root = base.get_root(position.path) or vim.loop.cwd() or ""
+      local root = base.get_project_root(position.path)
 
       local python_command = config.get_python_command(root)
       local runner = config.get_runner(python_command)
@@ -97,13 +98,16 @@ return function(config)
       local strategy_config
       if args.strategy == "dap" then
         strategy_config =
-          base.create_dap_config(python_command, script_path, script_args, config.dap_args)
+          base.create_dap_config(python_command, script_path, script_args, config.dap_args, root)
       end
       ---@type neotest.RunSpec
       return {
         command = vim.iter({ python_command, script_path, script_args }):flatten():totable(),
+        cwd = root,
         context = {
           results_path = results_path,
+          stream_path = stream_path,
+          tree = args.tree,
           stop_stream = stop_stream,
         },
         stream = function()
@@ -123,17 +127,6 @@ return function(config)
     ---@param spec neotest.RunSpec
     ---@param result neotest.StrategyResult
     ---@return neotest.Result[]
-    results = function(spec, result)
-      spec.context.stop_stream()
-      local success, data = pcall(lib.files.read, spec.context.results_path)
-      if not success then
-        data = "{}"
-      end
-      local results = vim.json.decode(data, { luanil = { object = true } })
-      for _, pos_result in pairs(results) do
-        result.output_path = pos_result.output_path
-      end
-      return results
-    end,
+    results = parse_results,
   }
 end

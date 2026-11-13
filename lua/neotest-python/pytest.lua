@@ -1,5 +1,6 @@
 local lib = require("neotest.lib")
 local logger = require("neotest.logging")
+local run_process = require("neotest-python.process")
 
 local M = {}
 
@@ -57,7 +58,7 @@ local function discover_params(python, script, path, positions, root)
   logger.debug("Running test instance discovery:", cmd)
 
   local test_params = {}
-  local res, data = lib.process.run(cmd, { stdout = true, stderr = true })
+  local res, data = run_process(cmd, root)
   if res ~= 0 then
     logger.warn("Pytest discovery failed")
     if data.stderr then
