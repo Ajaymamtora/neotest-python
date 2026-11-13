@@ -1,5 +1,6 @@
 local nio = require("nio")
 local lib = require("neotest.lib")
+local run_process = require("neotest-python.process")
 
 local M = {}
 
@@ -13,7 +14,7 @@ function M.is_test_file(file_path)
 end
 
 M.module_exists = function(module, python_command)
-  return lib.process.run(vim
+  return run_process(vim
     .iter({
       python_command,
       "-c",
@@ -29,66 +30,59 @@ local venv_bin = vim.loop.os_uname().sysname:match("Windows") and "Scripts" or "
 ---@return string[]
 function M.get_python_command(root)
   root = root or vim.loop.cwd()
-  if python_command_mem[root] then
-    return python_command_mem[root]
+  local cache_key = root .. "\0" .. (vim.env.VIRTUAL_ENV or "")
+  if python_command_mem[cache_key] then
+    return python_command_mem[cache_key]
   end
-  -- Use activated virtualenv.
-  if vim.env.VIRTUAL_ENV then
-    python_command_mem[root] = { vim.fs.joinpath(vim.env.VIRTUAL_ENV, venv_bin, "python") }
-    return python_command_mem[root]
+  local function remember(command)
+    python_command_mem[cache_key] = command
+    return command
   end
 
+  -- A selected project's environment takes precedence over another project's
+  -- activated environment. Do not resolve project files against Neovim's cwd.
   for _, pattern in ipairs({ "*", ".*" }) do
-    local match = nio.fn.glob(vim.fs.joinpath(root or nio.fn.getcwd(), pattern, "pyvenv.cfg"))
-    if match ~= "" then
-      python_command_mem[root] = { vim.fs.joinpath(vim.fs.dirname(match), venv_bin, "python") }
-      return python_command_mem[root]
-    end
-  end
-
-  if lib.files.exists("Pipfile") then
-    local success, exit_code, data = pcall(lib.process.run, { "pipenv", "--py" }, { stdout = true })
-    if success and exit_code == 0 then
-      local venv = data.stdout:gsub("\r?\n", "")
-      if venv then
-        python_command_mem[root] = { venv }
-        return python_command_mem[root]
+    local matches = nio.fn.glob(vim.fs.joinpath(root, pattern, "pyvenv.cfg"), false, true)
+    for _, match in ipairs(matches) do
+      local python = vim.fs.joinpath(vim.fs.dirname(match), venv_bin, "python")
+      if nio.fn.executable(python) == 1 then
+        return remember({ python })
       end
     end
   end
 
-  if lib.files.exists("pyproject.toml") then
-    local success, exit_code, data = pcall(
-      lib.process.run,
-      { "poetry", "run", "poetry", "env", "info", "-p" },
-      { stdout = true }
-    )
-    if success and exit_code == 0 then
-      local venv = data.stdout:gsub("\r?\n", "")
-      if venv then
-        python_command_mem[root] = { vim.fs.joinpath(venv, venv_bin, "python") }
-        return python_command_mem[root]
+  if vim.env.VIRTUAL_ENV then
+    return remember({ vim.fs.joinpath(vim.env.VIRTUAL_ENV, venv_bin, "python") })
+  end
+
+  local function project_command(marker, command, transform)
+    if not lib.files.exists(vim.fs.joinpath(root, marker)) then
+      return nil
+    end
+    local success, exit_code, data = pcall(run_process, command, root)
+    if success and exit_code == 0 and data and data.stdout then
+      local path = vim.trim(data.stdout)
+      if path ~= "" then
+        return remember({ transform and transform(path) or path })
       end
     end
   end
 
-  if lib.files.exists("uv.lock") then
-    local success, exit_code, data = pcall(
-      lib.process.run,
-      { "uv", "run", "python", "-c", "import sys; print(sys.executable)" },
-      { stdout = true }
-    )
-    if success and exit_code == 0 then
-      python_command_mem[root] = { data }
-      return python_command_mem[root]
-    end
+  local command = project_command("Pipfile", { "pipenv", "--py" })
+    or project_command("pyproject.toml", { "poetry", "env", "info", "-p" }, function(path)
+      return vim.fs.joinpath(path, venv_bin, "python")
+    end)
+    or project_command("uv.lock", { "uv", "run", "python", "-c", "import sys; print(sys.executable)" })
+  if command then
+    return command
   end
 
-  -- Fallback to system Python.
-  python_command_mem[root] = {
-    nio.fn.exepath("python3") or nio.fn.exepath("python") or "python",
-  }
-  return python_command_mem[root]
+  -- Fallback to system Python (exepath returns an empty string when absent).
+  local python = nio.fn.exepath("python3")
+  if python == "" then
+    python = nio.fn.exepath("python")
+  end
+  return remember({ python ~= "" and python or "python" })
 end
 
 ---@return string
@@ -107,12 +101,12 @@ end
 ---@param config neotest-python._AdapterConfig
 ---@param runner string
 ---@return string
-local function scan_test_function_pattern(runner, config, python_command)
+local function scan_test_function_pattern(runner, config, python_command, root)
   local test_function_pattern = "^test"
   if runner == "pytest" and config.pytest_discovery then
     local cmd = vim.iter({ python_command, M.get_script_path(), "--pytest-extract-test-name-template" }):flatten()
         :totable()
-    local _, data = lib.process.run(cmd, { stdout = true, stderr = true })
+    local _, data = run_process(cmd, root)
 
     for line in vim.gsplit(data.stdout, "\n", true) do
       if string.sub(line, 1, 1) == "{" and string.find(line, "python_functions") ~= nil then
@@ -128,8 +122,8 @@ end
 ---@param config neotest-python._AdapterConfig
 ---@param runner string
 ---@return string
-M.treesitter_queries = function(runner, config, python_command)
-  local test_function_pattern = scan_test_function_pattern(runner, config, python_command)
+M.treesitter_queries = function(runner, config, python_command, root)
+  local test_function_pattern = scan_test_function_pattern(runner, config, python_command, root)
   return string.format([[
     ;; Match undecorated functions
     ((function_definition
@@ -161,17 +155,36 @@ M.treesitter_queries = function(runner, config, python_command)
   ]], test_function_pattern, test_function_pattern)
 end
 
-M.get_root =
-    lib.files.match_root_pattern("pyproject.toml", "setup.cfg", "mypy.ini", "pytest.ini", "setup.py")
+local root_markers = { "pyproject.toml", "setup.cfg", "mypy.ini", "pytest.ini", "setup.py" }
 
-function M.create_dap_config(python_path, script_path, script_args, dap_args)
+function M.get_root(path)
+  local boundary = vim.fs.root(path, { ".git" })
+  local stat = vim.loop.fs_stat(path)
+  local start = stat and stat.type == "directory" and path or vim.fs.dirname(path)
+  local marker = vim.fs.find(root_markers, {
+    path = start,
+    upward = true,
+    stop = boundary and vim.fs.dirname(boundary) or nil,
+  })[1]
+  return marker and vim.fs.dirname(marker) or nil
+end
+
+-- Run/discovery fallback only: don't register this adapter for every Git repo.
+function M.get_project_root(path)
+  local stat = vim.loop.fs_stat(path)
+  return M.get_root(path)
+    or vim.fs.root(path, { ".git" })
+    or (stat and stat.type == "directory" and path or vim.fs.dirname(path))
+end
+
+function M.create_dap_config(python_path, script_path, script_args, dap_args, root)
   return vim.tbl_extend("keep", {
     type = "python",
     name = "Neotest Debugger",
     request = "launch",
     python = python_path,
     program = script_path,
-    cwd = nio.fn.getcwd(),
+    cwd = root,
     args = script_args,
   }, dap_args or {})
 end

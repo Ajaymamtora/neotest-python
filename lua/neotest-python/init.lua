@@ -5,7 +5,7 @@ local create_adapter = require("neotest-python.adapter")
 ---@field dap? table
 ---@field pytest_discover_instances? boolean
 ---@field is_test_file? fun(file_path: string):boolean
----@field python? string|string[]|fun(root: string):string[]
+---@field python? string|string[]|fun(root: string):string|string[]|nil
 ---@field args? string[]|fun(runner: string, position: neotest.Position, strategy: string): string[]
 ---@field runner? string|fun(python_command: string[]): string
 
@@ -24,14 +24,23 @@ local augment_config = function(config)
         python = config.python(root)
       end
 
-      if type(python) == "string" then
-        return { python }
+      if python == nil then
+        python = base.get_python_command(root)
+      elseif type(python) == "string" then
+        python = { python }
       end
-      if type(python) == "table" then
-        return python
+      assert(type(python) == "table" and #python > 0, "Python interpreter argv must not be empty")
+      python = vim.deepcopy(python)
+      for _, arg in ipairs(python) do
+        assert(type(arg) == "string" and arg ~= "", "Python interpreter argv contains an invalid argument")
       end
-
-      return base.get_python(root)
+      -- Preserve argv flags, but resolve relative interpreter paths before
+      -- runner detection or DAP can execute them from another working directory.
+      if not vim.startswith(python[1], "/") and not python[1]:match("^%a:[/\\]")
+        and python[1]:find("[/\\]") then
+        python[1] = vim.fs.joinpath(root, python[1])
+      end
+      return python
     end
   end
 
